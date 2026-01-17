@@ -54,8 +54,11 @@ def _get_or_create_booking(user_id: str) -> Dict[str, Any]:
             "pickup_required": None,         # True/False
             "payment_method": None,          # cash/card
             "price_aed": None,
+            "items": [],                     # list of activity line items
             "notes": []
         }
+    else:
+        BOOKINGS[user_id].setdefault("items", [])
     return BOOKINGS[user_id]
 
 def _normalize_bool(v: Any) -> Optional[bool]:
@@ -161,6 +164,7 @@ def booking_update(
     date_time_iso: Optional[str] = None,
     pickup_required: Optional[Any] = None,
     payment_method: Optional[str] = None,
+    add_item: Optional[dict] = None,
     notes: Optional[Any] = None,
 ) -> str:
     """
@@ -185,6 +189,7 @@ def booking_update(
         "date_time_iso": date_time_iso,
         "pickup_required": pickup_required,
         "payment_method": payment_method,
+        "add_item": add_item,
         "notes": notes,
     }
     for k, v in direct.items():
@@ -208,8 +213,48 @@ def booking_update(
             except Exception:
                 pass
 
+    def _ensure_items_from_draft() -> None:
+        if draft.get("items") is None:
+            draft["items"] = []
+        if draft["items"]:
+            return
+        if any(draft.get(k) not in [None, ""] for k in ["activity", "package", "vehicle_model", "quantity", "duration_min", "date_time_iso"]):
+            draft["items"].append({
+                "activity": draft.get("activity"),
+                "package": draft.get("package"),
+                "vehicle_model": draft.get("vehicle_model"),
+                "quantity": draft.get("quantity"),
+                "duration_min": draft.get("duration_min"),
+                "date_time_iso": draft.get("date_time_iso"),
+            })
+
+    def _normalize_item(item: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(item)
+        if out.get("activity"):
+            out["activity"] = str(out["activity"]).strip().lower()
+        for key in ["quantity", "duration_min"]:
+            if key in out and out[key] is not None:
+                try:
+                    out[key] = int(out[key])
+                except Exception:
+                    pass
+        return out
+
+    add_item_payload = merged.pop("add_item", None)
+    if isinstance(add_item_payload, dict):
+        _ensure_items_from_draft()
+        item = _normalize_item(add_item_payload)
+        draft["items"].append(item)
+        for key in ["activity", "package", "vehicle_model", "quantity", "duration_min"]:
+            if key in item and item[key] not in [None, ""]:
+                draft[key] = item[key]
+        if item.get("date_time_iso") and not draft.get("date_time_iso"):
+            draft["date_time_iso"] = item.get("date_time_iso")
+
     # apply
     for k, v in merged.items():
+        if k == "date_time_iso" and draft.get("items"):
+            continue
         if k in draft:
             draft[k] = v
         elif k == "notes":
@@ -218,16 +263,48 @@ def booking_update(
             else:
                 draft["notes"].append(str(v))
 
-    # readiness (NO seats requirement)
-    activity_val = (draft.get("activity") or "").strip().lower()
-    if activity_val == "safari":
-        required = ["customer_name", "activity", "package", "quantity", "date_time_iso", "payment_method", "pickup_required"]
+    item_keys = {"activity", "package", "vehicle_model", "quantity", "duration_min", "date_time_iso"}
+    if draft.get("items"):
+        current = draft["items"][-1]
+        for k in item_keys:
+            if k in merged:
+                current[k] = merged[k]
+        draft["items"][-1] = current
+
+    def _items_complete() -> bool:
+        items = draft.get("items") or []
+        for item in items:
+            activity_val = (item.get("activity") or "").strip().lower()
+            if not activity_val:
+                return False
+            if item.get("quantity") in [None, ""]:
+                return False
+            if not (item.get("date_time_iso") or draft.get("date_time_iso")):
+                return False
+            if activity_val == "safari":
+                if not item.get("package"):
+                    return False
+            else:
+                if item.get("duration_min") in [None, ""]:
+                    return False
+                if not item.get("vehicle_model"):
+                    return False
+        return True
+
+    if draft.get("items"):
+        required = ["customer_name", "payment_method", "pickup_required"]
+        is_ready = _items_complete() and all(draft.get(r) not in [None, ""] for r in required)
     else:
-        required = ["customer_name", "activity", "quantity", "duration_min", "date_time_iso", "payment_method", "pickup_required"]
-    is_ready = all(draft.get(r) not in [None, ""] for r in required)
+        # readiness (NO seats requirement)
+        activity_val = (draft.get("activity") or "").strip().lower()
+        if activity_val == "safari":
+            required = ["customer_name", "activity", "package", "quantity", "date_time_iso", "payment_method", "pickup_required"]
+        else:
+            required = ["customer_name", "activity", "quantity", "duration_min", "date_time_iso", "payment_method", "pickup_required"]
+        is_ready = all(draft.get(r) not in [None, ""] for r in required)
 
     draft["status"] = "ready_to_confirm" if is_ready else "collecting"
-    if any(k in merged for k in ["quantity", "duration_min", "pickup_required", "payment_method"]):
+    if any(k in merged for k in ["quantity", "duration_min", "pickup_required", "payment_method"]) or add_item_payload:
         draft["price_aed"] = None
     BOOKINGS[user_id] = draft
 
@@ -263,53 +340,96 @@ def booking_compute_price(user_id: str) -> str:
     dt_iso = draft.get("date_time_iso")
     dur = draft.get("duration_min")
     qty = draft.get("quantity")
+    items = draft.get("items") or []
 
-    if dt_iso:
+    def _parse_start_dt(dt_value: str) -> Optional[datetime]:
         try:
-            dt = datetime.fromisoformat(dt_iso)
-            dt = _ensure_dubai_tz(dt)
+            parsed = datetime.fromisoformat(dt_value)
+            return _ensure_dubai_tz(parsed)
         except Exception:
-            return json.dumps({"error": "I couldn't understand the time. Please tell me the time in Dubai time (e.g., 'tomorrow 5pm').", "draft": draft})
+            return None
+
+    if items:
+        for item in items:
+            item_dt_value = item.get("date_time_iso") or dt_iso
+            if not item_dt_value:
+                return json.dumps({"error": "Missing booking time for one of the activities.", "draft": draft})
+            dt = _parse_start_dt(str(item_dt_value))
+            if dt is None:
+                return json.dumps({"error": "I couldn't understand the time. Please tell me the time in Dubai time (e.g., 'tomorrow 5pm').", "draft": draft})
+            item_dur = item.get("duration_min")
+            if item_dur is None and (item.get("activity") or "").strip().lower() != "safari":
+                return json.dumps({"error": "Missing duration for one of the activities.", "draft": draft})
+            if item.get("quantity") is None:
+                return json.dumps({"error": "Missing quantity for one of the activities.", "draft": draft})
+            if item_dur is not None:
+                if not _within_open_hours_start_end(dt, int(item_dur)):
+                    return json.dumps({"error": "That start time plus the selected duration goes beyond our closing time (7pm). Please choose an earlier start time.", "draft": draft})
     else:
-        return json.dumps({"error": "Missing booking time.", "draft": draft})
+        if dt_iso:
+            try:
+                dt = datetime.fromisoformat(dt_iso)
+                dt = _ensure_dubai_tz(dt)
+            except Exception:
+                return json.dumps({"error": "I couldn't understand the time. Please tell me the time in Dubai time (e.g., 'tomorrow 5pm').", "draft": draft})
+        else:
+            return json.dumps({"error": "Missing booking time.", "draft": draft})
 
-    if dur is None:
-        return json.dumps({"error": "Missing duration.", "draft": draft})
-
-    if not _within_open_hours_start_end(dt, int(dur)):
-        return json.dumps({"error": "That start time plus the selected duration goes beyond our closing time (7pm). Please choose an earlier start time.", "draft": draft})
+        if dur is None:
+            return json.dumps({"error": "Missing duration.", "draft": draft})
+        if not _within_open_hours_start_end(dt, int(dur)):
+            return json.dumps({"error": "That start time plus the selected duration goes beyond our closing time (7pm). Please choose an earlier start time.", "draft": draft})
 
     base = 0.0
-
-    if draft.get("activity") == "buggy":
-        if not qty or not dur:
-            return json.dumps({"error": "Missing quantity or duration for buggy booking.", "draft": draft})
-
-        table = BUGGY_4_SEAT if _is_buggy_4_seat(draft.get("vehicle_model")) else BUGGY_2_SEAT
-
-        if int(dur) not in table:
-            return json.dumps({"error": "Unsupported buggy duration. Please choose 30, 60, 90, or 120 minutes.", "draft": draft})
-
-        base = table[int(dur)] * int(qty)
-
-    elif draft.get("activity") == "quad":
-        # Fallback: pricing must be fetched from KB
-        return json.dumps({
-            "needs_pricing_from_kb": True,
-            "message": "Quad pricing should be retrieved from the knowledge base.",
-            "draft": draft
-        })
-
-
-    elif draft.get("activity") == "safari":
-        # Fallback: pricing must be fetched from KB
-        return json.dumps({
-            "needs_pricing_from_kb": True,
-            "message": "Safari pricing should be retrieved from the knowledge base.",
-            "draft": draft
-        })
+    if items:
+        needs_kb = False
+        for item in items:
+            activity_val = (item.get("activity") or "").strip().lower()
+            if activity_val == "buggy":
+                if not item.get("quantity") or not item.get("duration_min"):
+                    return json.dumps({"error": "Missing quantity or duration for buggy booking.", "draft": draft})
+                table = BUGGY_4_SEAT if _is_buggy_4_seat(item.get("vehicle_model")) else BUGGY_2_SEAT
+                if int(item["duration_min"]) not in table:
+                    return json.dumps({"error": "Unsupported buggy duration. Please choose 30, 60, 90, or 120 minutes.", "draft": draft})
+                base += table[int(item["duration_min"])] * int(item["quantity"])
+            else:
+                needs_kb = True
+        if needs_kb:
+            return json.dumps({
+                "needs_pricing_from_kb": True,
+                "message": "Multi-activity pricing should be retrieved from the knowledge base.",
+                "draft": draft
+            })
     else:
-        return json.dumps({"error": "Select an activity first (buggy/quad/safari).", "draft": draft})
+        if draft.get("activity") == "buggy":
+            if not qty or not dur:
+                return json.dumps({"error": "Missing quantity or duration for buggy booking.", "draft": draft})
+
+            table = BUGGY_4_SEAT if _is_buggy_4_seat(draft.get("vehicle_model")) else BUGGY_2_SEAT
+
+            if int(dur) not in table:
+                return json.dumps({"error": "Unsupported buggy duration. Please choose 30, 60, 90, or 120 minutes.", "draft": draft})
+
+            base = table[int(dur)] * int(qty)
+
+        elif draft.get("activity") == "quad":
+            # Fallback: pricing must be fetched from KB
+            return json.dumps({
+                "needs_pricing_from_kb": True,
+                "message": "Quad pricing should be retrieved from the knowledge base.",
+                "draft": draft
+            })
+
+
+        elif draft.get("activity") == "safari":
+            # Fallback: pricing must be fetched from KB
+            return json.dumps({
+                "needs_pricing_from_kb": True,
+                "message": "Safari pricing should be retrieved from the knowledge base.",
+                "draft": draft
+            })
+        else:
+            return json.dumps({"error": "Select an activity first (buggy/quad/safari).", "draft": draft})
 
     if draft.get("pickup_required") is True:
         base += PICKUP_FEE

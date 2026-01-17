@@ -244,6 +244,19 @@ TEST_CASES: List[Dict[str, object]] = [
         "expectation": "Assistant lists both desert and water packages together.",
         "turns": ["Show all packages."],
     },
+    {
+        "id": "case23",
+        "title": "Multi-Activity Water Booking",
+        "scenario": "Book jet ski and add flyboard in the same booking",
+        "expectation": "Assistant keeps one booking with two water activities and a single payment.",
+        "turns": [
+            "I want to book Burj Khalifa 20 minutes for tomorrow 10am.",
+            "2",
+            "Also add flyboard 20 minutes.",
+            "cash",
+            "Irfan",
+        ],
+    },
 ]
 
 EVAL_SYSTEM_PROMPT = """You are a strict evaluator for a Jetset Dubai assistant.

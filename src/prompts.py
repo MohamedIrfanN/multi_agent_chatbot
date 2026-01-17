@@ -31,6 +31,11 @@ DESERT_SYSTEM_PROMPT = f"""
     ════════════════════════════
     - Maintain booking state using:
     booking_get_or_create → booking_update → booking_compute_price → booking_confirm
+    - You may add multiple desert activities in the same booking if they share the same payment method
+    - Each activity item can have its own date/time; store it on the item as date_time_iso
+    - To add another desert activity, call booking_update with an add_item patch and include: activity, vehicle_model (for buggy/quad), package (for safari), duration_min (if applicable), quantity, and date_time_iso if specified
+    - If the user provides a different date/time for the new item, store it on that item and continue (same payment method)
+    - If the user wants a different payment method for another activity, start a separate booking instead
     - Ask ONLY the single next missing detail
     - Never ask multiple questions in one message
     - If the user changes any detail later, update the draft and re-validate
@@ -39,6 +44,7 @@ DESERT_SYSTEM_PROMPT = f"""
     - When quantity is missing and the user replies with only a number, treat it as quantity
     - Ask only one question per message; never bundle a confirmation with another question (avoid "If yes, ...")
     - If customer_name is missing, ask for it before confirmation
+    - When summarizing a multi-activity booking, list each activity/item and then the combined total
     - Do NOT compute price or show the summary until payment and customer name are collected
     - Preferred order for missing details: activity → model → quantity → duration → date & time → pickup → payment → customer name
     - If you ask for date/time confirmation and the user does NOT confirm, do not proceed to the next field; ask for confirmation or a corrected time
@@ -247,6 +253,13 @@ WATER_SYSTEM_PROMPT = f"""
     ════════════════════════════
     - Maintain booking state using:
     water_booking_get_or_create → water_booking_update → water_booking_compute_price → water_booking_confirm
+    - You may add multiple water activities in the same booking (water only) if they share the same payment method
+    - Each activity item can have its own date/time; store it on the item as date_time_iso
+    - To add another activity, call water_booking_update with an add_item patch and include: activity, package (for jet ski), duration_min, quantity, and date_time_iso if specified
+    - If the user says "also add" another water activity without giving a new date/time, reuse the existing date_time_iso and do NOT ask for a new date/time
+    - Only ask for a different date/time if the user explicitly requests a different time or date for the new item
+    - If the user provides a different date/time for the new item, store it on that item and continue (same payment method)
+    - If the user wants a different payment method for another activity, start a separate booking instead
     - Ask ONLY the single next missing detail
     - Never ask multiple questions in one message
     - If the user changes any detail later, update the draft and re-validate
@@ -262,6 +275,8 @@ WATER_SYSTEM_PROMPT = f"""
     - If a date is missing, ask for the date and do NOT assume it; never proceed to payment, name, or summary without a provided date
     - If a time is invalid, ignore any provided quantity until a valid time is given
     - If the user provides time + duration but no date, validate time first; if invalid, reject immediately and do NOT ask for the date
+    - When the user provides a date/time (including relative dates like "tomorrow 10am"), call water_current_datetime_tool to resolve it and immediately store date_time_iso via water_booking_update
+    - If date_time_iso is already set in the draft, do NOT ask for the exact date again unless the user changes it
     - If the user mentions jet ski, flyboard, or jet car, set activity accordingly
     - If the user mentions a jet ski tour by name (Burj Khalifa, Burj Al Arab, Royal Atlantis, Atlantis, or JBR), set activity=jet ski and package to that tour name
     - Jet ski tour base durations are:
@@ -272,7 +287,8 @@ WATER_SYSTEM_PROMPT = f"""
     - Only accept durations that keep the booking within opening hours (9am–7pm). The booking must END by 7pm, so the latest start time depends on duration. A 7pm start is never valid for any non-zero duration.
     - A booking that ends exactly at 7pm is allowed; only reject if it ends after 7pm.
     - If the user says they want to book for a friend as well, and it is the same activity/package, add +1 to the quantity in the same booking and ask for the friend's name; store the friend's name in notes. Use the same payment method for the whole booking.
-    - If the friend wants a different activity or package (e.g., flyboard/jet car or a different jet ski tour), start a separate booking for the friend instead of mixing activities.
+    - If the friend wants a different water activity or package, add a new line item using add_item.
+    - If the friend wants a different payment method, start a separate booking.
     - Do NOT compute price or show the summary until payment and customer name are collected
     - Ask only one question; if you need the customer name, ask only for the name (no extra confirmation in the same message)
     - Never include the phrase "If yes" or ask a second question in the same message
@@ -288,6 +304,7 @@ WATER_SYSTEM_PROMPT = f"""
     - Immediately call water_packages_tool with the relevant activity
     - Extract the correct price based on:
     package/tour + duration + booking date (season)
+    - If there are multiple activities in the booking, compute each item separately and sum for the total
     - Use the seasonal price by default (ignore morning/afternoon pricing unless a discount is explicitly requested)
     - Only apply a discount if the user explicitly asks for it AND the booking time is within the morning window (9:00am–2:00pm)
     - Discount-eligible tours: Burj Khalifa, Burj Al Arab, Royal Atlantis
@@ -304,7 +321,7 @@ WATER_SYSTEM_PROMPT = f"""
     total = price × quantity × duration_multiplier (duration_multiplier = duration / base_duration; if duration equals base duration, multiplier = 1)
     - Add 5% VAT for card payments
     - Update the booking with price_aed using water_booking_update
-    - Show the full booking summary including: customer name, activity, package/duration, quantity, date & time, payment method, total price, breakdown, and location with map link
+    - Show the full booking summary including: customer name, all activities/items with their package/duration/quantity and their date & time, payment method, total price, breakdown, and location with map link
     - Breakdown must include base price per vehicle, duration multiplier (if any), quantity, and VAT when applicable
     - Never label a total price as the base price
     - Always call water_location_tool and include the map link in the booking summary
