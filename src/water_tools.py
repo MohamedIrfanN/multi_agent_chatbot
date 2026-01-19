@@ -97,6 +97,108 @@ def _jetski_base_duration(package: Optional[str]) -> Optional[int]:
             return base
     return None
 
+def _parse_start_dt(dt_value: str) -> Optional[datetime]:
+    """Parse ISO datetime string and ensure it's in Dubai timezone."""
+    try:
+        parsed = datetime.fromisoformat(dt_value)
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=ZoneInfo(TZ))
+    return parsed.astimezone(ZoneInfo(TZ))
+
+def _validate_booking_times(draft: Dict[str, Any]) -> Optional[str]:
+    """Validate booking times against opening hours (9am-7pm). Returns error message or None."""
+    items = draft.get("items") or []
+    bookings_to_check = items if items else [draft]
+    
+    for booking in bookings_to_check:
+        dt_value = booking.get("date_time_iso") or draft.get("date_time_iso")
+        duration = booking.get("duration_min") or draft.get("duration_min")
+        
+        if not dt_value or not duration:
+            continue
+            
+        start_dt = _parse_start_dt(str(dt_value))
+        if start_dt is None:
+            return "Invalid booking time format."
+            
+        opening_start = start_dt.replace(hour=9, minute=0, second=0, microsecond=0)
+        opening_end = start_dt.replace(hour=19, minute=0, second=0, microsecond=0)
+        end_dt = start_dt + timedelta(minutes=int(duration))
+        
+        if start_dt < opening_start or end_dt > opening_end:
+            return "Booking time must start after 9am and finish by 7pm. Please choose a time that fits the full duration."
+    
+    return None
+
+def _validate_jetski_duration(draft: Dict[str, Any]) -> Optional[str]:
+    """Validate jet ski duration is a multiple of base duration. Returns error message or None."""
+    items = draft.get("items") or []
+    bookings_to_check = items if items else [draft]
+    
+    for booking in bookings_to_check:
+        activity = (booking.get("activity") or "").strip().lower()
+        if activity in {"jetski", "jet ski"}:
+            base = _jetski_base_duration(booking.get("package"))
+            duration = booking.get("duration_min")
+            if base and duration and duration % base != 0:
+                return f"Invalid duration for {booking.get('package')}. Must be a multiple of {base} minutes."
+    
+    return None
+
+def _validate_time_immediately(draft: Dict[str, Any]) -> Optional[str]:
+    """
+    Check if we have enough info to validate time (date_time_iso + duration_min).
+    If both exist, validate immediately. Returns error message if invalid, None if valid or not enough info.
+    This validates BEFORE other fields are collected.
+    """
+    dt_value = draft.get("date_time_iso")
+    duration = draft.get("duration_min")
+    
+    # Only validate if BOTH are present
+    if not dt_value or not duration:
+        return None
+    
+    # Parse and validate
+    start_dt = _parse_start_dt(str(dt_value))
+    if start_dt is None:
+        return "Invalid booking time format."
+    
+    opening_start = start_dt.replace(hour=9, minute=0, second=0, microsecond=0)
+    opening_end = start_dt.replace(hour=19, minute=0, second=0, microsecond=0)
+    end_dt = start_dt + timedelta(minutes=int(duration))
+    
+    if start_dt < opening_start or end_dt > opening_end:
+        return "Booking time must start after 9am and finish by 7pm. Please choose a time that fits the full duration."
+    
+    return None
+
+def _normalize_value(value: Any, key: str) -> Any:
+    """Normalize a single value based on key type."""
+    if value is None:
+        return None
+    
+    if key == "pickup_required":
+        return _normalize_bool(value)
+    
+    if key in {"activity", "payment_method"}:
+        return str(value).strip().lower()
+    
+    if key in {"quantity", "duration_min"}:
+        try:
+            return int(value)
+        except Exception:
+            return value
+    
+    if key == "price_aed":
+        try:
+            return float(value)
+        except Exception:
+            return value
+    
+    return value
+
 @tool
 def water_booking_get_or_create(user_id: str) -> str:
     """Get or create a water booking draft object for a given Telegram user_id."""
@@ -147,28 +249,10 @@ def water_booking_update(
         if v is not None:
             merged[k] = v
 
-    # normalize
-    if "pickup_required" in merged:
-        merged["pickup_required"] = _normalize_bool(merged["pickup_required"])
-
-    if "activity" in merged and merged["activity"]:
-        merged["activity"] = str(merged["activity"]).strip().lower()
-
-    if "payment_method" in merged and merged["payment_method"]:
-        merged["payment_method"] = str(merged["payment_method"]).strip().lower()
-
-    for key in ["quantity", "duration_min"]:
-        if key in merged and merged[key] is not None:
-            try:
-                merged[key] = int(merged[key])
-            except Exception:
-                pass
-
-    if "price_aed" in merged and merged["price_aed"] is not None:
-        try:
-            merged["price_aed"] = float(merged["price_aed"])
-        except Exception:
-            pass
+    # Normalize all values
+    for k in list(merged.keys()):
+        if k != "add_item":
+            merged[k] = _normalize_value(merged[k], k)
 
     def _ensure_items_from_draft() -> None:
         if draft.get("items") is None:
@@ -186,14 +270,8 @@ def water_booking_update(
 
     def _normalize_item(item: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(item)
-        if out.get("activity"):
-            out["activity"] = str(out["activity"]).strip().lower()
-        for key in ["quantity", "duration_min"]:
-            if key in out and out[key] is not None:
-                try:
-                    out[key] = int(out[key])
-                except Exception:
-                    pass
+        for k in out:
+            out[k] = _normalize_value(out[k], k)
         return out
 
     add_item_payload = merged.pop("add_item", None)
@@ -218,6 +296,14 @@ def water_booking_update(
                 draft["notes"].extend(v)
             else:
                 draft["notes"].append(str(v))
+
+    # IMMEDIATE TIME VALIDATION (fail fast)
+    # Check if we just set duration_min or date_time_iso
+    if any(k in merged for k in ["duration_min", "date_time_iso"]):
+        time_error = _validate_time_immediately(draft)
+        if time_error:
+            # Return error without marking as ready - force agent to fix time first
+            return json.dumps({"error": time_error, "draft": draft})
 
     item_keys = {"activity", "package", "quantity", "duration_min", "date_time_iso"}
     if draft.get("items"):
@@ -253,6 +339,11 @@ def water_booking_update(
     draft["status"] = "ready_to_confirm" if is_ready else "collecting"
     if any(k in merged for k in ["quantity", "duration_min", "pickup_required", "payment_method"]) or add_item_payload:
         draft["price_aed"] = None
+    
+    # Don't clear price if it's being explicitly set (e.g., after discount calculation)
+    if "price_aed" in merged and merged["price_aed"] is not None:
+        pass  # Keep the price that was set above
+    
     WATER_BOOKINGS[user_id] = draft
 
     return json.dumps(draft)
@@ -264,15 +355,11 @@ def water_booking_compute_price(user_id: str) -> str:
     Always recalculates; never uses cached prices.
     """
     draft = _get_or_create_water_booking(user_id)
-
-    # REMOVE the early return that uses cached price
-    # OLD: if draft.get("price_aed") is not None:
-    #        return json.dumps({"price_aed": draft["price_aed"], "draft": draft})
-    
-    # ALWAYS clear stale price and recalculate
     draft["price_aed"] = None
 
     items = draft.get("items") or []
+    
+    # Validate completeness
     if items:
         for item in items:
             if item.get("duration_min") is None:
@@ -291,59 +378,15 @@ def water_booking_compute_price(user_id: str) -> str:
         if draft.get("quantity") is None:
             return json.dumps({"error": "Missing quantity.", "draft": draft})
 
-    def _parse_start_dt(dt_value: str) -> Optional[datetime]:
-        try:
-            parsed = datetime.fromisoformat(dt_value)
-        except Exception:
-            return None
-        if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=ZoneInfo(TZ))
-        return parsed.astimezone(ZoneInfo(TZ))
+    # Validate times
+    time_error = _validate_booking_times(draft)
+    if time_error:
+        return json.dumps({"error": time_error, "draft": draft})
 
-    if items:
-        for item in items:
-            item_dt_value = item.get("date_time_iso") or draft.get("date_time_iso")
-            start_dt = _parse_start_dt(str(item_dt_value))
-            if start_dt is None:
-                return json.dumps({"error": "Invalid booking time format.", "draft": draft})
-            opening_start = start_dt.replace(hour=9, minute=0, second=0, microsecond=0)
-            opening_end = start_dt.replace(hour=19, minute=0, second=0, microsecond=0)
-            end_dt = start_dt + timedelta(minutes=int(item["duration_min"]))
-            if start_dt < opening_start or end_dt > opening_end:
-                return json.dumps({
-                    "error": "Booking time must start after 9am and finish by 7pm. Please choose a time that fits the full duration.",
-                    "draft": draft
-                })
-            activity_val = (item.get("activity") or "").strip().lower()
-            if activity_val in {"jetski", "jet ski"}:
-                base = _jetski_base_duration(item.get("package"))
-                duration = int(item.get("duration_min") or 0)
-                if base and duration % base != 0:
-                    return json.dumps({
-                        "error": f"Invalid duration for {item.get('package')}. Must be a multiple of {base} minutes.",
-                        "draft": draft
-                    })
-    else:
-        start_dt = _parse_start_dt(str(draft.get("date_time_iso")))
-        if start_dt is None:
-            return json.dumps({"error": "Invalid booking time format.", "draft": draft})
-        opening_start = start_dt.replace(hour=9, minute=0, second=0, microsecond=0)
-        opening_end = start_dt.replace(hour=19, minute=0, second=0, microsecond=0)
-        end_dt = start_dt + timedelta(minutes=int(draft["duration_min"]))
-        if start_dt < opening_start or end_dt > opening_end:
-            return json.dumps({
-                "error": "Booking time must start after 9am and finish by 7pm. Please choose a time that fits the full duration.",
-                "draft": draft
-            })
-
-        if draft.get("activity") in {"jetski", "jet ski"}:
-            base = _jetski_base_duration(draft.get("package"))
-            duration = draft.get("duration_min")
-            if base and duration % base != 0:
-                return json.dumps({
-                    "error": f"Invalid duration for {draft.get('package')}. Must be a multiple of {base} minutes.",
-                    "draft": draft
-                })
+    # Validate jet ski durations
+    duration_error = _validate_jetski_duration(draft)
+    if duration_error:
+        return json.dumps({"error": duration_error, "draft": draft})
 
     return json.dumps({
         "needs_pricing_from_kb": True,
@@ -352,9 +395,22 @@ def water_booking_compute_price(user_id: str) -> str:
     })
 
 @tool
-def water_booking_confirm(user_id: str) -> str:
-    """Confirm a water booking if the draft is complete and a price has been computed."""
+def water_booking_confirm(user_id: str, final_price_aed: Optional[float] = None) -> str:
+    """Confirm a water booking if the draft is complete and a price has been computed.
+    
+    Args:
+        user_id: The user ID
+        final_price_aed: Optional final price to save before confirming (e.g., after discount calculation)
+    """
     draft = _get_or_create_water_booking(user_id)
+
+    # If agent provides final price (e.g., after discount calculation), save it first
+    if final_price_aed is not None:
+        try:
+            draft["price_aed"] = float(final_price_aed)
+            WATER_BOOKINGS[user_id] = draft
+        except Exception:
+            pass
 
     if draft.get("status") != "ready_to_confirm":
         return json.dumps({"error": "Booking is not complete yet.", "draft": draft})
