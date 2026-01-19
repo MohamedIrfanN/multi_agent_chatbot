@@ -54,6 +54,7 @@ def _get_or_create_booking(user_id: str) -> Dict[str, Any]:
             "pickup_required": None,         # True/False
             "payment_method": None,          # cash/card
             "price_aed": None,
+            "price_aed_base": None,          # Base price before VAT (used for recalc when payment method changes)
             "items": [],                     # list of activity line items
             "notes": []
         }
@@ -263,6 +264,32 @@ def booking_update(
                 draft["notes"].extend(v)
             else:
                 draft["notes"].append(str(v))
+
+    # Store price (LLM already calculated with correct VAT if applicable)
+    # DO NOT re-apply VAT here - the LLM has already handled it correctly in the breakdown
+    if "price_aed" in merged and merged["price_aed"] is not None:
+        # Store as base price only for recalculation if payment_method changes
+        # Assume LLM provided the FINAL price (with VAT if card was chosen)
+        final_price = float(merged["price_aed"])
+        
+        # Extract base price by checking current payment method
+        # If card, divide by 1.05 to get base; otherwise, price IS the base
+        current_payment = (draft.get("payment_method") or "").lower()
+        if current_payment == "card":
+            draft["price_aed_base"] = round(final_price / CARD_VAT_MULTIPLIER, 2)
+        else:
+            draft["price_aed_base"] = round(final_price, 2)
+        
+        draft["price_aed"] = final_price
+    
+    # RECALCULATE PRICE IF PAYMENT_METHOD CHANGED (use base price, reapply VAT logic)
+    if "payment_method" in merged and draft.get("price_aed_base") is not None:
+        base_price = draft["price_aed_base"]
+        new_payment = str(merged["payment_method"]).lower().strip() if merged["payment_method"] else ""
+        if new_payment == "card":
+            draft["price_aed"] = round(base_price * CARD_VAT_MULTIPLIER, 2)
+        else:
+            draft["price_aed"] = round(base_price, 2)
 
     item_keys = {"activity", "package", "vehicle_model", "quantity", "duration_min", "date_time_iso"}
     if draft.get("items"):

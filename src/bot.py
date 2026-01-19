@@ -354,19 +354,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _generate_summary(user_id)
         message_counter[user_id] = 0  # Reset counter after summary
     if _wants_both_packages(user_text):
-        # Extract date/time hint if user mentioned it
-        time_match = _TIME_OR_DATE_RE.search(user_text)
-        date_hint = ""
-        if time_match:
-            date_hint = f" (User mentioned: {time_match.group(1)})"
+        # Check if there's an active booking
+        has_desert = has_active_desert_booking(user_id)
+        has_water = has_active_water_booking(user_id)
         
-        desert_executor = make_desert_executor(user_id)
-        water_executor = make_water_executor(user_id)
-        desert_result = desert_executor.invoke({"input": f"[user_id={user_id}] List buggy, quad, and safari packages with prices.{date_hint}"})
-        water_result = water_executor.invoke({"input": f"[user_id={user_id}] Show all water packages.{date_hint}"})
-        desert_reply = _enforce_single_question((desert_result.get("output") or "").strip())
-        water_reply = _enforce_single_question((water_result.get("output") or "").strip())
-        reply = f"Desert packages:\n{desert_reply}\n\nWater packages:\n{water_reply}"
+        if has_desert or has_water:
+            # One booking is already in progress, complete it first
+            if has_desert:
+                reply = "You have an active desert booking in progress. Please complete it first (confirm or cancel), then you can start a water activity booking separately."
+            else:
+                reply = "You have an active water booking in progress. Please complete it first (confirm or cancel), then you can start a desert activity booking separately."
+        else:
+            # No active bookings, but user wants both - ask them to choose one first
+            reply = "Great! We offer both desert activities (Buggy, Quad, Safari) and water activities (Jet Ski, Flyboard, Jet Car). " \
+                    "However, we process them as separate bookings. " \
+                    "Which would you like to book first: a desert activity or a water activity? " \
+                    "Once you complete the first booking, you can start another one."
+        
         await update.message.reply_text(reply)
         return
 

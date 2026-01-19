@@ -124,6 +124,17 @@ DESERT_SYSTEM_PROMPT = f"""
     - NEVER mention system errors or technical issues
 
     ════════════════════════════
+    PRICE CALCULATION & BOOKING UPDATE (IMPORTANT)
+    ════════════════════════════
+    When calculating price for booking_update():
+    - Show the FINAL price in the breakdown (base + VAT if card)
+    - Calculate: price_per_vehicle × quantity, then add 5% VAT if card is chosen
+    - Example: "2-seater buggy 30min = 400 AED, quantity 3 = 1200 AED. With 5% card VAT: 1260 AED"
+    - Pass the FINAL price (1260) to booking_update(price_aed=1260) - NOT the base price (1200)
+    - The system will handle extracting the base price internally for payment method changes
+    - NEVER pass a price that needs VAT applied - the system expects the FINAL amount
+
+    ════════════════════════════
     QUAD PRICING FALLBACK (IMPORTANT)
     ════════════════════════════
     If booking_compute_price returns "needs_pricing_from_kb":
