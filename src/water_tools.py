@@ -44,6 +44,11 @@ def water_current_datetime_tool(tz: str = "Asia/Dubai") -> str:
     return json.dumps({"tz": tz, "now_iso": now.isoformat()})
 
 # ----------------------------
+# Pricing
+# ----------------------------
+CARD_VAT_MULTIPLIER = 1.05
+
+# ----------------------------
 # Booking Store (separate from desert)
 # ----------------------------
 WATER_BOOKINGS: Dict[str, Dict[str, Any]] = {}
@@ -69,6 +74,7 @@ def _get_or_create_water_booking(user_id: str) -> Dict[str, Any]:
             "pickup_required": False,        # Water bookings do not offer pickup
             "payment_method": None,          # cash/card/crypto
             "price_aed": None,
+            "price_aed_base": None,          # Base price before VAT (used for recalc when payment method changes)
             "items": [],                     # list of activity line items
             "notes": []
         }
@@ -297,6 +303,32 @@ def water_booking_update(
             else:
                 draft["notes"].append(str(v))
 
+    # Store price (LLM already calculated with correct VAT if applicable)
+    # DO NOT re-apply VAT here - the LLM has already handled it correctly in the breakdown
+    if "price_aed" in merged and merged["price_aed"] is not None:
+        # Store as base price only for recalculation if payment_method changes
+        # Assume LLM provided the FINAL price (with VAT if card was chosen)
+        final_price = float(merged["price_aed"])
+        
+        # Extract base price by checking current payment method
+        # If card, divide by 1.05 to get base; otherwise, price IS the base
+        current_payment = (draft.get("payment_method") or "").lower()
+        if current_payment == "card":
+            draft["price_aed_base"] = round(final_price / CARD_VAT_MULTIPLIER, 2)
+        else:
+            draft["price_aed_base"] = round(final_price, 2)
+        
+        draft["price_aed"] = final_price
+    
+    # RECALCULATE PRICE IF PAYMENT_METHOD CHANGED (use base price, reapply VAT logic)
+    if "payment_method" in merged and draft.get("price_aed_base") is not None:
+        base_price = draft["price_aed_base"]
+        new_payment = str(merged["payment_method"]).lower().strip() if merged["payment_method"] else ""
+        if new_payment == "card":
+            draft["price_aed"] = round(base_price * CARD_VAT_MULTIPLIER, 2)
+        else:
+            draft["price_aed"] = round(base_price, 2)
+
     # IMMEDIATE TIME VALIDATION (fail fast)
     # Check if we just set duration_min or date_time_iso
     if any(k in merged for k in ["duration_min", "date_time_iso"]):
@@ -441,12 +473,21 @@ def water_location_tool() -> str:
     return json.dumps(_water_search("Water Jetset location address contact phone map", k=6))
 
 @tool
-def water_packages_tool(activity: str = "all") -> str:
-    """Return packages/prices/durations from the knowledge base for water activities."""
+def water_packages_tool(activity: str = "all", booking_date: Optional[str] = None) -> str:
+    """Return packages/prices/durations from the knowledge base for water activities.
+    
+    Args:
+        activity: jet ski, flyboard, jet car, or all
+        booking_date: ISO date (2026-01-19) or DD-MM-YYYY for season-aware pricing
+    """
     activity = (activity or "all").lower().strip()
     if activity not in {"jetski", "jet ski", "flyboard", "jetcar", "jet car", "all"}:
         activity = "all"
     q = f"Packages prices durations for {activity} water activities Water Jetset Dubai"
+    # Include booking date to help KB return correct season prices
+    if booking_date:
+        date_str = booking_date.split("T")[0] if "T" in booking_date else booking_date
+        q += f" on {date_str}"
     return json.dumps(_water_search(q, k=8))
 
 @tool

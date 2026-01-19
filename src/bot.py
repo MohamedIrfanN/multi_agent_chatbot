@@ -79,12 +79,14 @@ water_agent = create_openai_tools_agent(llm, water_tool_list, water_prompt)
 # For production, you should make one memory per user.
 memory_store: Dict[str, ConversationBufferWindowMemory] = {}  # key -> memory object
 router_state: Dict[str, str] = {}  # user_id -> last_agent
+summary_store: Dict[str, str] = {}  # user_id -> accumulated summaries
+message_counter: Dict[str, int] = {}  # user_id -> messages since last summary
 
 def get_memory(user_id: str, agent_key: str) -> ConversationBufferWindowMemory:
     key = user_id
     if key not in memory_store:
         memory_store[key] = ConversationBufferWindowMemory(
-            k=20,  # keep last 20 turns (tune as needed)
+            k=20,  # keep last 20 turns 
             return_messages=True,
             memory_key="chat_history"
         )
@@ -181,6 +183,71 @@ def _get_last_agent(user_id: str) -> str:
 
 def _set_last_agent(user_id: str, agent_key: str) -> None:
     router_state[user_id] = agent_key
+
+def _increment_message_count(user_id: str) -> int:
+    """Increment and return message count for user."""
+    current = message_counter.get(user_id, 0)
+    message_counter[user_id] = current + 1
+    return message_counter[user_id]
+
+def _get_accumulated_summary(user_id: str) -> str:
+    """Get accumulated summaries for user."""
+    return summary_store.get(user_id, "")
+
+def _reset_summary(user_id: str) -> None:
+    """Reset summary counter and store after booking confirmed."""
+    message_counter[user_id] = 0
+    if user_id in summary_store:
+        del summary_store[user_id]
+
+def _generate_summary(user_id: str) -> None:
+    """Generate summary of last 20 messages and accumulate."""
+    mem = get_memory(user_id, "summary")
+    history = mem.load_memory_variables({}).get("chat_history", [])
+    
+    if not history:
+        return
+    
+    # Build conversation text from last ~20 messages
+    text_parts = []
+    for msg in history[-20:]:
+        role = getattr(msg, "type", "unknown")
+        content = getattr(msg, "content", "")
+        if content:
+            text_parts.append(f"{role}: {content}")
+    
+    if not text_parts:
+        return
+    
+    conversation_text = "\n".join(text_parts)
+    
+    # Quick summary prompt to extract booking context
+    summary_prompt = f"""Summarize the key booking details from this conversation. 
+Preserve: activity type, vehicle/package name, duration, date/time, price, discount, any booking stages reached.
+Keep it concise (2-3 sentences):
+
+{conversation_text}
+
+SUMMARY:"""
+    
+    try:
+        response = llm.invoke([("human", summary_prompt)])
+        summary_text = (response.content or "").strip()
+        
+        # Accumulate with previous summary
+        if user_id in summary_store:
+            summary_store[user_id] += f"\n{summary_text}"
+        else:
+            summary_store[user_id] = summary_text
+    except Exception:
+        pass  # If summary fails, don't break the flow
+
+def _format_agent_input_with_summary(user_id: str, user_text: str) -> str:
+    """Format agent input with booking context if available."""
+    acc_summary = _get_accumulated_summary(user_id)
+    if acc_summary:
+        return f"[BOOKING_CONTEXT]\n{acc_summary}\n[/BOOKING_CONTEXT]\n\n[user_id={user_id}] {user_text}"
+    return f"[user_id={user_id}] {user_text}"
 
 def route_agent(user_id: str, user_text: str) -> str:
     water_match = _WATER_KEYWORDS.search(user_text)
@@ -281,12 +348,22 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text:
         await update.message.reply_text("I didn’t catch that. Please type your message.")
         return
-
+    # Increment message counter and check if we should generate summary
+    msg_count = _increment_message_count(user_id)
+    if msg_count % 20 == 0:
+        _generate_summary(user_id)
+        message_counter[user_id] = 0  # Reset counter after summary
     if _wants_both_packages(user_text):
+        # Extract date/time hint if user mentioned it
+        time_match = _TIME_OR_DATE_RE.search(user_text)
+        date_hint = ""
+        if time_match:
+            date_hint = f" (User mentioned: {time_match.group(1)})"
+        
         desert_executor = make_desert_executor(user_id)
         water_executor = make_water_executor(user_id)
-        desert_result = desert_executor.invoke({"input": f"[user_id={user_id}] List buggy, quad, and safari packages with prices."})
-        water_result = water_executor.invoke({"input": f"[user_id={user_id}] Show all water packages."})
+        desert_result = desert_executor.invoke({"input": f"[user_id={user_id}] List buggy, quad, and safari packages with prices.{date_hint}"})
+        water_result = water_executor.invoke({"input": f"[user_id={user_id}] Show all water packages.{date_hint}"})
         desert_reply = _enforce_single_question((desert_result.get("output") or "").strip())
         water_reply = _enforce_single_question((water_result.get("output") or "").strip())
         reply = f"Desert packages:\n{desert_reply}\n\nWater packages:\n{water_reply}"
@@ -305,7 +382,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if route == "desert":
             # Pass user_id inline so the agent can use it when calling booking tools
-            agent_input = f"[user_id={user_id}] {user_text}"
+            agent_input = _format_agent_input_with_summary(user_id, user_text)
             executor = make_desert_executor(user_id)
             result = executor.invoke({"input": agent_input})
             reply = _enforce_single_question((result.get("output") or "").strip())
@@ -320,7 +397,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         hints.append(f"use base duration {base_duration} minutes")
                 if hints:
                     hinted_text = f"{user_text} ({'; '.join(hints)})"
-            agent_input = f"[user_id={user_id}] {hinted_text}"
+            agent_input = _format_agent_input_with_summary(user_id, hinted_text)
             executor = make_water_executor(user_id)
             result = executor.invoke({"input": agent_input})
             reply = _enforce_single_question((result.get("output") or "").strip())
