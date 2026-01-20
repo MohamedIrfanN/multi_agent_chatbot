@@ -64,7 +64,7 @@ def _infer_booking_date_from_context() -> Optional[str]:
     if not _CURRENT_WATER_USER_ID:
         return None
     draft = WATER_BOOKINGS.get(_CURRENT_WATER_USER_ID, {})
-    dt_value = draft.get("date_time_iso")
+    dt_value = draft.get("booking_date") or draft.get("date_time_iso")
     if not dt_value:
         return None
     return str(dt_value).split("T")[0]
@@ -402,6 +402,8 @@ def water_booking_update(
                 draft["notes"].extend(v)
             else:
                 draft["notes"].append(str(v))
+    if "date_time_iso" in merged and draft.get("date_time_iso"):
+        draft["booking_date"] = str(draft["date_time_iso"]).split("T")[0]
 
     # Store price (LLM already calculated with correct VAT if applicable)
     # DO NOT re-apply VAT here - the LLM has already handled it correctly in the breakdown
