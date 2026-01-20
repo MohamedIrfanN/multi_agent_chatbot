@@ -19,7 +19,7 @@ from langchain.memory import ConversationBufferWindowMemory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from src.tools import desert_tools, has_active_desert_booking
-from src.water_tools import water_tools, has_active_water_booking
+from src.water_tools import water_tools, has_active_water_booking, set_current_water_user_id
 from src.prompts import (
     DESERT_SYSTEM_PROMPT,
     WATER_SYSTEM_PROMPT,
@@ -135,7 +135,7 @@ _TIME_OR_DATE_RE = re.compile(
     re.IGNORECASE,
 )
 _PRICE_INQUIRY_RE = re.compile(r"\b(price|cost|how much|rate|quote|discount)\b", re.IGNORECASE)
-_DURATION_RE = re.compile(r"\b\d+\s*(min|minute|minutes)\b", re.IGNORECASE)
+_DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|min)(?!\w)", re.IGNORECASE)
 _BOTH_PACKAGES_RE = re.compile(r"\bboth\b.*\bpackage", re.IGNORECASE)
 _BOTH_SHOW_RE = re.compile(r"\b(show|display|list)\b.*\bboth\b", re.IGNORECASE)
 _ALL_PACKAGES_RE = re.compile(r"\ball\b.*\bpackage", re.IGNORECASE)
@@ -151,6 +151,20 @@ _BASE_TOUR_DURATIONS = [
 
 def _is_price_inquiry(text: str) -> bool:
     return _PRICE_INQUIRY_RE.search(text) is not None
+
+def _parse_duration_to_minutes(duration_str: str) -> int | None:
+    """Convert '2.5 hours', '150 minutes', '2 hrs', etc. to minutes."""
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|min)", duration_str, re.IGNORECASE)
+    if not match:
+        return None
+    
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    
+    if unit in {"hour", "hours", "hr", "hrs", "h"}:
+        return int(value * 60)
+    else:  # minutes
+        return int(value)
 
 def _has_duration(text: str) -> bool:
     return _DURATION_RE.search(text) is not None
@@ -252,16 +266,28 @@ def _format_agent_input_with_summary(user_id: str, user_text: str) -> str:
 def route_agent(user_id: str, user_text: str) -> str:
     water_match = _WATER_KEYWORDS.search(user_text)
     desert_match = _DESERT_KEYWORDS.search(user_text)
+    
+    # Check for conflicting bookings (trying to book both at once)
+    has_active_water = has_active_water_booking(user_id)
+    has_active_desert = has_active_desert_booking(user_id)
+    
     if water_match and desert_match:
         return "clarify"
+    
+    # If user is trying to switch to a different activity type while one is active, reject it
+    if water_match and has_active_desert:
+        return "block_mixed"
+    if desert_match and has_active_water:
+        return "block_mixed"
+    
     if water_match:
         return "water"
     if desert_match:
         return "desert"
 
-    if has_active_water_booking(user_id):
+    if has_active_water:
         return "water"
-    if has_active_desert_booking(user_id):
+    if has_active_desert:
         return "desert"
 
     last_agent = _get_last_agent(user_id)
@@ -348,6 +374,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text:
         await update.message.reply_text("I didn’t catch that. Please type your message.")
         return
+    if _WATER_KEYWORDS.search(user_text) and _DESERT_KEYWORDS.search(user_text):
+        await update.message.reply_text(
+            "We can’t combine desert and water activities in one booking. Please choose one to book first."
+        )
+        return
     # Increment message counter and check if we should generate summary
     msg_count = _increment_message_count(user_id)
     if msg_count % 20 == 0:
@@ -384,6 +415,17 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     route = route_agent(user_id, user_text)
 
     try:
+        if route == "block_mixed":
+            # User is trying to book a different activity type while one is active
+            has_active_water = has_active_water_booking(user_id)
+            has_active_desert = has_active_desert_booking(user_id)
+            if has_active_water:
+                reply = "You have an active water booking in progress. Please complete it first (confirm or cancel), then you can start a desert activity booking separately."
+            else:
+                reply = "You have an active desert booking in progress. Please complete it first (confirm or cancel), then you can start a water activity booking separately."
+            await update.message.reply_text(reply)
+            return
+        
         if route == "desert":
             # Pass user_id inline so the agent can use it when calling booking tools
             agent_input = _format_agent_input_with_summary(user_id, user_text)
@@ -395,6 +437,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hinted_text = user_text
             if _is_price_inquiry(user_text):
                 hints = ["price inquiry only; provide the price without booking questions"]
+                
+                # Check if user explicitly asked for discount
+                discount_keywords = re.compile(r"\b(discount|discounted|cheaper|morning price|early bird)\b", re.IGNORECASE)
+                if not discount_keywords.search(user_text):
+                    hints.append("show regular price only (no discounts since user did not ask for discount)")
+                
                 if not _has_duration(user_text):
                     base_duration = _infer_base_duration(user_text)
                     if base_duration:
@@ -402,6 +450,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if hints:
                     hinted_text = f"{user_text} ({'; '.join(hints)})"
             agent_input = _format_agent_input_with_summary(user_id, hinted_text)
+            set_current_water_user_id(user_id)
             executor = make_water_executor(user_id)
             result = executor.invoke({"input": agent_input})
             reply = _enforce_single_question((result.get("output") or "").strip())

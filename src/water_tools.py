@@ -52,6 +52,22 @@ CARD_VAT_MULTIPLIER = 1.05
 # Booking Store (separate from desert)
 # ----------------------------
 WATER_BOOKINGS: Dict[str, Dict[str, Any]] = {}
+_CURRENT_WATER_USER_ID: Optional[str] = None
+
+def set_current_water_user_id(user_id: Optional[str]) -> None:
+    """Set the current user id so tools can infer booking_date when missing."""
+    global _CURRENT_WATER_USER_ID
+    _CURRENT_WATER_USER_ID = user_id
+
+def _infer_booking_date_from_context() -> Optional[str]:
+    """Best-effort booking_date from current user's draft."""
+    if not _CURRENT_WATER_USER_ID:
+        return None
+    draft = WATER_BOOKINGS.get(_CURRENT_WATER_USER_ID, {})
+    dt_value = draft.get("date_time_iso")
+    if not dt_value:
+        return None
+    return str(dt_value).split("T")[0]
 _JETSKI_BASE_DURATIONS = [
     ("burj khalifa", 20),
     ("burj al arab", 30),
@@ -103,6 +119,34 @@ def _jetski_base_duration(package: Optional[str]) -> Optional[int]:
             return base
     return None
 
+def _get_season_for_date(date_str: str) -> str:
+    """Determine season (High/Low/Summer End) for a given date.
+    
+    Args:
+        date_str: ISO date string "YYYY-MM-DD"
+    
+    Returns:
+        "high_season" | "low_season" | "summer_end"
+    """
+    try:
+        date = datetime.fromisoformat(date_str)
+        month = date.month
+        day = date.day
+        
+        # High Season: Nov 15 - Mar 15
+        if (month == 11 and day >= 15) or month == 12 or (month == 1) or (month == 2) or (month == 3 and day <= 15):
+            return "high_season"
+        
+        # Low Season: Mar 16 - Aug 31
+        elif (month == 3 and day >= 16) or (4 <= month <= 8):
+            return "low_season"
+        
+        # Summer End: Sep 1 - Nov 14
+        else:  # Sep, Oct, or Nov (before 15)
+            return "summer_end"
+    except Exception:
+        return "high_season"  # Default fallback
+
 def _parse_start_dt(dt_value: str) -> Optional[datetime]:
     """Parse ISO datetime string and ensure it's in Dubai timezone."""
     try:
@@ -139,19 +183,75 @@ def _validate_booking_times(draft: Dict[str, Any]) -> Optional[str]:
     return None
 
 def _validate_jetski_duration(draft: Dict[str, Any]) -> Optional[str]:
-    """Validate jet ski duration is a multiple of base duration. Returns error message or None."""
+    """Validate duration based on activity type. Returns error message or None."""
     items = draft.get("items") or []
     bookings_to_check = items if items else [draft]
     
     for booking in bookings_to_check:
         activity = (booking.get("activity") or "").strip().lower()
+        duration = booking.get("duration_min")
+        
+        if not duration:
+            continue
+        
+        duration = int(duration)
+        
+        # JET SKI: Must be multiple of base duration
         if activity in {"jetski", "jet ski"}:
             base = _jetski_base_duration(booking.get("package"))
-            duration = booking.get("duration_min")
-            if base and duration and duration % base != 0:
+            if base and duration % base != 0:
                 return f"Invalid duration for {booking.get('package')}. Must be a multiple of {base} minutes."
+        
+        # FLYBOARD: Validate with greedy algorithm (bases: 30, 20)
+        elif activity == "flyboard":
+            if not _can_divide_duration([30, 20], duration):
+                return f"Duration {duration} minutes is not available for flyboard. Try a different duration."
+        
+        # JET CAR: Validate with greedy algorithm (bases: 60, 30, 20)
+        elif activity in {"jetcar", "jet car"}:
+            if not _can_divide_duration([60, 30, 20], duration):
+                return f"Duration {duration} minutes is not available for jet car. Try a different duration."
     
     return None
+
+def _can_divide_duration(bases: list, duration: int) -> bool:
+    """Check if duration can be divided into bases using any valid combination.
+    
+    Uses BFS to find if duration can be made by summing any combination of bases.
+    For example:
+    - _can_divide_duration([30, 20], 140) → True (4×30 + 1×20)
+    - _can_divide_duration([60, 30, 20], 100) → True (1×60 + 2×20)
+    - _can_divide_duration([30, 20], 25) → False (no valid combination)
+    
+    Args:
+        bases: List of base durations (e.g., [30, 20] for flyboard, [60, 30, 20] for jet car)
+        duration: Target duration in minutes
+    
+    Returns:
+        True if duration can be made from bases, False otherwise
+    """
+    from collections import deque
+    
+    visited = {duration}
+    queue = deque([duration])
+    
+    while queue:
+        remaining = queue.popleft()
+        
+        if remaining == 0:
+            return True
+        
+        if remaining < 0:
+            continue
+        
+        # Try subtracting each base
+        for base in bases:
+            new_remaining = remaining - base
+            if new_remaining >= 0 and new_remaining not in visited:
+                visited.add(new_remaining)
+                queue.append(new_remaining)
+    
+    return False
 
 def _validate_time_immediately(draft: Dict[str, Any]) -> Optional[str]:
     """
@@ -483,6 +583,8 @@ def water_packages_tool(activity: str = "all", booking_date: Optional[str] = Non
     activity = (activity or "all").lower().strip()
     if activity not in {"jetski", "jet ski", "flyboard", "jetcar", "jet car", "all"}:
         activity = "all"
+    if not booking_date:
+        booking_date = _infer_booking_date_from_context()
     q = f"Packages prices durations for {activity} water activities Water Jetset Dubai"
     # Include booking date to help KB return correct season prices
     if booking_date:
