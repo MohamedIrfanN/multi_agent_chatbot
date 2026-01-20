@@ -19,7 +19,12 @@ from langchain.memory import ConversationBufferWindowMemory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from src.tools import desert_tools, has_active_desert_booking
-from src.water_tools import water_tools, has_active_water_booking, set_current_water_user_id
+from src.water_tools import (
+    water_tools,
+    has_active_water_booking,
+    set_current_water_user_id,
+    water_booking_update,
+)
 from src.prompts import (
     DESERT_SYSTEM_PROMPT,
     WATER_SYSTEM_PROMPT,
@@ -101,7 +106,7 @@ def make_desert_executor(user_id: str) -> AgentExecutor:
         verbose=False,
         handle_parsing_errors=True,
         max_iterations=12,
-        early_stopping_method="generate"
+        early_stopping_method="force"
     )
 
 def make_water_executor(user_id: str) -> AgentExecutor:
@@ -113,7 +118,7 @@ def make_water_executor(user_id: str) -> AgentExecutor:
         verbose=True,
         handle_parsing_errors=True,
         max_iterations=12,
-        early_stopping_method="generate"
+        early_stopping_method="force"
     )
 
 def run_general_agent(user_id: str, user_text: str) -> str:
@@ -139,6 +144,7 @@ _DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|min)(?!\w)
 _BOTH_PACKAGES_RE = re.compile(r"\bboth\b.*\bpackage", re.IGNORECASE)
 _BOTH_SHOW_RE = re.compile(r"\b(show|display|list)\b.*\bboth\b", re.IGNORECASE)
 _ALL_PACKAGES_RE = re.compile(r"\ball\b.*\bpackage", re.IGNORECASE)
+_PAYMENT_RE = re.compile(r"\b(cash|card|credit|debit|crypto|cryptocurrency|btc|eth)\b", re.IGNORECASE)
 
 _BASE_TOUR_DURATIONS = [
     ("burj khalifa", 20),
@@ -191,6 +197,18 @@ def _wants_both_packages(text: str) -> bool:
 def _is_short_followup(text: str) -> bool:
     words = re.findall(r"[a-zA-Z0-9']+", text.strip())
     return 0 < len(words) <= 4
+
+def _extract_payment_method(text: str) -> str | None:
+    if not _is_short_followup(text):
+        return None
+    lower = text.lower()
+    if "card" in lower or "credit" in lower or "debit" in lower:
+        return "card"
+    if "cash" in lower:
+        return "cash"
+    if "crypto" in lower or "cryptocurrency" in lower or "btc" in lower or "eth" in lower:
+        return "cryptocurrency"
+    return None
 
 def _get_last_agent(user_id: str) -> str:
     return router_state.get(user_id, "general")
@@ -379,6 +397,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "We can’t combine desert and water activities in one booking. Please choose one to book first."
         )
         return
+    payment_method = _extract_payment_method(user_text)
+    if payment_method and has_active_water_booking(user_id):
+        try:
+            water_booking_update(user_id=user_id, payment_method=payment_method)
+        except Exception:
+            pass
     # Increment message counter and check if we should generate summary
     msg_count = _increment_message_count(user_id)
     if msg_count % 20 == 0:

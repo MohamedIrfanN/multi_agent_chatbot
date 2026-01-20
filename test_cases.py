@@ -13,7 +13,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 
 import src.bot as bot
 from src.tools import BOOKINGS
-from src.water_tools import WATER_BOOKINGS
+from src.water_tools import WATER_BOOKINGS, water_booking_update
 
 EVAL_MODEL = os.getenv("EVAL_MODEL", os.getenv("CHAT_MODEL", "gpt-4.1-mini"))
 EVAL_LLM = ChatOpenAI(model=EVAL_MODEL, temperature=0)
@@ -257,6 +257,249 @@ TEST_CASES: List[Dict[str, object]] = [
             "Irfan",
         ],
     },
+    {
+        "id": "case24",
+        "title": "Multi-Activity Quantity Apply All",
+        "scenario": "Provide multiple water activities then say '1 for all'",
+        "expectation": "Assistant applies quantity to all missing items and proceeds.",
+        "turns": [
+            "I want jet car 20 minutes tomorrow 10am, flyboard 20 minutes tomorrow 11am, and Burj Al Arab 30 minutes tomorrow 11:30am.",
+            "1 for all",
+        ],
+    },
+    {
+        "id": "case25",
+        "title": "Water Quantity Limit",
+        "scenario": "Attempt to book too many water vehicles",
+        "expectation": "Assistant rejects and asks to split into multiple bookings.",
+        "turns": [
+            "I want to book Burj Al Arab 30 minutes for tomorrow 10am.",
+            "yes",
+            "30",
+        ],
+    },
+    {
+        "id": "case26",
+        "title": "Water Mixed Activities Full Flow",
+        "scenario": "Book jet car + flyboard + jet ski with quantities and confirm",
+        "expectation": "Assistant collects missing details once, computes pricing, and confirms.",
+        "turns": [
+            "My name is Wael. I want 20 mins jet car at tomorrow 10am, 20 mins flyboard at tomorrow 11am, and Burj Al Arab 30 mins at tomorrow 11:30.",
+            "1 for all",
+            "yes",
+            "cash",
+            "confirm",
+        ],
+    },
+    {
+        "id": "case27",
+        "title": "Water Discount Eligibility Auto-Apply",
+        "scenario": "Ask if discount eligible and proceed; should use discounted price",
+        "expectation": "Assistant applies morning discount after eligibility question and confirms with discounted total.",
+        "turns": [
+            "I want to book Royal Atlantis for tomorrow 10am, 60 minutes.",
+            "1",
+            "Is there any discount?",
+            "card",
+            "Irfan",
+            "confirm",
+        ],
+    },
+    {
+        "id": "case28",
+        "title": "Water Discount Not Eligible",
+        "scenario": "Ask about discount outside morning window; should use seasonal price",
+        "expectation": "Assistant explains not eligible and uses seasonal price.",
+        "turns": [
+            "I want to book Burj Al Arab 30 minutes for tomorrow 6pm.",
+            "1",
+            "Any discount?",
+            "cash",
+            "Irfan",
+            "confirm",
+        ],
+    },
+    {
+        "id": "case29",
+        "title": "Water Conflicting Date Changes",
+        "scenario": "User changes date/time after providing quantity",
+        "expectation": "Assistant updates date/time, revalidates, and continues.",
+        "turns": [
+            "Book Burj Khalifa 20 minutes for tomorrow 10am.",
+            "2",
+            "Make it day after tomorrow 9am instead.",
+            "cash",
+            "Irfan",
+            "confirm",
+        ],
+    },
+    {
+        "id": "case30",
+        "title": "Water Invalid Duration and Retry",
+        "scenario": "Provide invalid duration then correct it",
+        "expectation": "Assistant rejects invalid duration and accepts valid multiple.",
+        "turns": [
+            "I want Burj Khalifa 25 minutes tomorrow 10am.",
+            "Change to 40 minutes.",
+            "1",
+            "cash",
+            "Irfan",
+            "confirm",
+        ],
+    },
+    {
+        "id": "case31",
+        "title": "Water Payment Switch Reprice",
+        "scenario": "Choose cash then switch to card; VAT should apply",
+        "expectation": "Assistant updates total with VAT after payment method switch.",
+        "turns": [
+            "Book Burj Al Arab 30 minutes tomorrow 10am.",
+            "1",
+            "cash",
+            "Irfan",
+            "Actually card",
+            "confirm",
+        ],
+    },
+    {
+        "id": "case32",
+        "title": "Mixed Desert and Water Booking Attempt",
+        "scenario": "User tries to book desert and water together",
+        "expectation": "Assistant blocks and asks to book separately.",
+        "turns": [
+            "I want to book a buggy and a jet ski for tomorrow 10am.",
+        ],
+    },
+    {
+        "id": "case33",
+        "title": "Water Quantity Phrase Variants",
+        "scenario": "User gives quantity in a phrase after multi-activity list",
+        "expectation": "Assistant applies quantity to all missing items.",
+        "turns": [
+            "Jet car 20 minutes tomorrow 10am and flyboard 20 minutes tomorrow 11am and Burj Khalifa 20 minutes tomorrow 11:30.",
+            "one each",
+            "cash",
+            "Irfan",
+            "confirm",
+        ],
+    },
+    {
+        "id": "case34",
+        "title": "Water Missing Package Then Provide",
+        "scenario": "User says jet ski 30 minutes without tour name, then adds tour",
+        "expectation": "Assistant asks tour name, then proceeds without re-asking other details.",
+        "turns": [
+            "I want to book a jet ski for 30 minutes tomorrow 10am.",
+            "Burj Al Arab",
+            "1",
+            "cash",
+            "Irfan",
+            "confirm",
+        ],
+    },
+    {
+        "id": "case35",
+        "title": "Water Live Chat Hesitations",
+        "scenario": "User asks about safety and location mid-booking, then continues",
+        "expectation": "Assistant answers side questions, keeps booking flow, and confirms.",
+        "turns": [
+            "Hi, I want to book Royal Atlantis 60 minutes tomorrow 10am.",
+            "How safe is it?",
+            "2",
+            "Where are you located?",
+            "card",
+            "My name is Sara.",
+            "confirm",
+        ],
+    },
+    {
+        "id": "case36",
+        "title": "Water Contradictions and Corrections",
+        "scenario": "User changes duration and time multiple times",
+        "expectation": "Assistant updates details and validates time, then confirms.",
+        "turns": [
+            "Book Burj Khalifa 40 minutes tomorrow 6pm.",
+            "Actually make it 20 minutes.",
+            "Sorry, 60 minutes at 5pm.",
+            "1",
+            "cash",
+            "Irfan",
+            "confirm",
+        ],
+    },
+    {
+        "id": "case37",
+        "title": "Water Discount Doubt Then Proceed",
+        "scenario": "User asks about discount eligibility and hesitates",
+        "expectation": "Assistant explains eligibility and uses correct price on confirmation.",
+        "turns": [
+            "I want Burj Al Arab 30 minutes tomorrow 10am.",
+            "1",
+            "Is discount possible?",
+            "I am not sure, is that final price?",
+            "card",
+            "Irfan",
+            "confirm",
+        ],
+    },
+    {
+        "id": "case38",
+        "title": "Water Mixed Questions With Name Early",
+        "scenario": "User gives name early, asks off-topic question, then books",
+        "expectation": "Assistant stores name and continues booking without re-asking.",
+        "turns": [
+            "My name is Lina. I want to book flyboard 20 minutes tomorrow 11am.",
+            "Do you accept crypto?",
+            "1",
+            "Yes card",
+            "confirm",
+        ],
+    },
+    {
+        "id": "case39",
+        "title": "Live Chat Water With Doubts",
+        "scenario": "User changes details, asks safety, then confirms",
+        "expectation": "Assistant handles side questions, updates details, and confirms.",
+        "turns": [
+            "Hey, I want to book Royal Atlantis 60 minutes tomorrow 10am for me and a friend.",
+            "Is it safe for beginners?",
+            "Make it 11am instead.",
+            "2",
+            "Any discount if we pay cash?",
+            "Ok card then.",
+            "My name is Omar.",
+            "confirm",
+        ],
+    },
+    {
+        "id": "case40",
+        "title": "Live Chat Mixed Desert + Water Then Split",
+        "scenario": "User tries to book desert and water together, then proceeds with water only",
+        "expectation": "Assistant blocks mixed booking, then handles water booking cleanly.",
+        "turns": [
+            "I need a jet ski at 10am tomorrow and a buggy at 4pm tomorrow.",
+            "Ok just the jet ski then. Burj Al Arab 30 minutes at 10am tomorrow.",
+            "1",
+            "cash",
+            "Irfan",
+            "confirm",
+        ],
+    },
+    {
+        "id": "case41",
+        "title": "Live Chat Price First Then Book",
+        "scenario": "User asks price, then books, then changes date to another season",
+        "expectation": "Assistant uses booking_date for pricing and updates on date change.",
+        "turns": [
+            "How much is Burj Khalifa 20 minutes?",
+            "I want to book it for 21-01-2026 at 10am.",
+            "2",
+            "Actually make it 20-07-2026 at 10am.",
+            "cash",
+            "Lina",
+            "confirm",
+        ],
+    },
 ]
 
 EVAL_SYSTEM_PROMPT = """You are a strict evaluator for a Jetset Dubai assistant.
@@ -288,6 +531,14 @@ def reset_user_state(user_id: str) -> None:
 
 
 def send(user_id: str, text: str) -> str:
+    if bot._WATER_KEYWORDS.search(text) and bot._DESERT_KEYWORDS.search(text):
+        return "We can't combine desert and water activities in one booking. Please choose one to book first."
+    payment_method = bot._extract_payment_method(text)
+    if payment_method and bot.has_active_water_booking(user_id):
+        try:
+            water_booking_update(user_id=user_id, payment_method=payment_method)
+        except Exception:
+            pass
     if bot._wants_both_packages(text):
         desert_executor = bot.make_desert_executor(user_id)
         water_executor = bot.make_water_executor(user_id)

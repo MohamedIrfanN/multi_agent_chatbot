@@ -52,6 +52,7 @@ CARD_VAT_MULTIPLIER = 1.05
 # Booking Store (separate from desert)
 # ----------------------------
 WATER_BOOKINGS: Dict[str, Dict[str, Any]] = {}
+MAX_WATER_QUANTITY = 10
 _CURRENT_WATER_USER_ID: Optional[str] = None
 
 def set_current_water_user_id(user_id: Optional[str]) -> None:
@@ -324,7 +325,7 @@ def water_booking_update(
     pickup_required: Optional[Any] = None,
     payment_method: Optional[str] = None,
     price_aed: Optional[float] = None,
-    add_item: Optional[dict] = None,
+    add_item: Optional[Any] = None,
     notes: Optional[Any] = None,
 ) -> str:
     """
@@ -360,6 +361,8 @@ def water_booking_update(
         if k != "add_item":
             merged[k] = _normalize_value(merged[k], k)
 
+    item_keys = {"activity", "package", "quantity", "duration_min", "date_time_iso"}
+
     def _ensure_items_from_draft() -> None:
         if draft.get("items") is None:
             draft["items"] = []
@@ -381,6 +384,8 @@ def water_booking_update(
         return out
 
     add_item_payload = merged.pop("add_item", None)
+    if add_item_payload is True:
+        add_item_payload = {k: merged.get(k) for k in item_keys if k in merged}
     if isinstance(add_item_payload, dict):
         _ensure_items_from_draft()
         item = _normalize_item(add_item_payload)
@@ -392,6 +397,20 @@ def water_booking_update(
             draft["date_time_iso"] = item.get("date_time_iso")
 
     # apply
+    if draft.get("items") and not isinstance(add_item_payload, dict) and "date_time_iso" in merged:
+        last_item = draft["items"][-1]
+        if last_item.get("date_time_iso") and merged["date_time_iso"] != last_item.get("date_time_iso"):
+            _ensure_items_from_draft()
+            item = _normalize_item({k: merged.get(k) for k in item_keys if k in merged})
+            draft["items"].append(item)
+
+    if isinstance(merged.get("items"), list):
+        normalized_items = []
+        for item in merged["items"]:
+            if isinstance(item, dict):
+                normalized_items.append(_normalize_item(item))
+        merged["items"] = normalized_items
+
     for k, v in merged.items():
         if k == "date_time_iso" and draft.get("items"):
             continue
@@ -404,6 +423,11 @@ def water_booking_update(
                 draft["notes"].append(str(v))
     if "date_time_iso" in merged and draft.get("date_time_iso"):
         draft["booking_date"] = str(draft["date_time_iso"]).split("T")[0]
+
+    if "quantity" in merged and draft.get("items"):
+        for item in draft["items"]:
+            if item.get("quantity") in [None, ""]:
+                item["quantity"] = merged["quantity"]
 
     # Store price (LLM already calculated with correct VAT if applicable)
     # DO NOT re-apply VAT here - the LLM has already handled it correctly in the breakdown
@@ -439,13 +463,51 @@ def water_booking_update(
             # Return error without marking as ready - force agent to fix time first
             return json.dumps({"error": time_error, "draft": draft})
 
-    item_keys = {"activity", "package", "quantity", "duration_min", "date_time_iso"}
     if draft.get("items"):
         current = draft["items"][-1]
         for k in item_keys:
             if k in merged:
                 current[k] = merged[k]
         draft["items"][-1] = current
+        seen_items = set()
+        deduped = []
+        for item in draft["items"]:
+            key = (
+                item.get("activity"),
+                item.get("package"),
+                item.get("duration_min"),
+                item.get("date_time_iso"),
+                item.get("quantity"),
+            )
+            if key in seen_items:
+                continue
+            seen_items.add(key)
+            deduped.append(item)
+        draft["items"] = deduped
+
+    def _check_quantity_limit(activity_val: str, quantity_val: Any) -> Optional[str]:
+        if quantity_val in [None, ""]:
+            return None
+        try:
+            qty_int = int(quantity_val)
+        except Exception:
+            return None
+        if qty_int > MAX_WATER_QUANTITY:
+            activity_label = activity_val or "activity"
+            return f"Sorry, we can accept a maximum of {MAX_WATER_QUANTITY} vehicles per {activity_label} booking."
+        return None
+
+    if draft.get("items"):
+        for item in draft["items"]:
+            activity_val = (item.get("activity") or "").strip().lower()
+            qty_error = _check_quantity_limit(activity_val, item.get("quantity"))
+            if qty_error:
+                return json.dumps({"error": qty_error, "draft": draft})
+    else:
+        activity_val = (draft.get("activity") or "").strip().lower()
+        qty_error = _check_quantity_limit(activity_val, draft.get("quantity"))
+        if qty_error:
+            return json.dumps({"error": qty_error, "draft": draft})
 
     def _items_complete() -> bool:
         items = draft.get("items") or []
@@ -471,12 +533,9 @@ def water_booking_update(
         is_ready = all(draft.get(r) not in [None, ""] for r in required)
 
     draft["status"] = "ready_to_confirm" if is_ready else "collecting"
-    if any(k in merged for k in ["quantity", "duration_min", "pickup_required", "payment_method"]) or add_item_payload:
+    clear_price = any(k in merged for k in ["quantity", "duration_min", "pickup_required", "payment_method", "items"]) or add_item_payload
+    if clear_price and ("price_aed" not in merged or merged["price_aed"] is None):
         draft["price_aed"] = None
-    
-    # Don't clear price if it's being explicitly set (e.g., after discount calculation)
-    if "price_aed" in merged and merged["price_aed"] is not None:
-        pass  # Keep the price that was set above
     
     WATER_BOOKINGS[user_id] = draft
 
